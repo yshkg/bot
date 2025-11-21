@@ -1,192 +1,254 @@
 import asyncio
 import logging
-from aiogram import Bot, Dispatcher
-from aiogram.filters import Command, CommandObject
-from aiogram.types import Message
+import os
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import Command, StateFilter
+from aiogram.types import Message, CallbackQuery, FSInputFile
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 
-from config import BOT_TOKEN, MANAGERS_IDS, EMPLOYEES_IDS
+from config import BOT_TOKEN, MANAGERS, EMPLOYEES
 import database as db
+import keyboards as kb
+from texts import MESSAGES
 
-# Включаем логирование
 logging.basicConfig(level=logging.INFO)
-
-# Инициализация бота и диспетчера
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 
+class FinanceForm(StatesGroup):
+    waiting_for_amount = State()
+    waiting_for_comment = State()
+
+
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 
-def is_manager(user_id):
-    return user_id in MANAGERS_IDS
+def get_role(user_id):
+    if user_id in MANAGERS: return "manager"
+    if user_id in EMPLOYEES: return "employee"
+    return None
 
 
-def is_employee(user_id):
-    return user_id in EMPLOYEES_IDS
+def get_category_code(text):
+    """Ищет код категории по тексту кнопки."""
+    for lang in MESSAGES:
+        for key, value in MESSAGES[lang].items():
+            if value == text:
+                # Исключаем системные кнопки, оставляем только финансовые категории
+                if key.startswith("btn_") and key not in ["btn_report", "btn_mgr_report", "btn_excel", "btn_reset",
+                                                          "btn_cancel", "btn_help"]:
+                    return key.replace("btn_", "")
+    return None
 
 
-async def generate_report_text():
-    """Генерирует текст отчета на основе данных из БД."""
-    stats = await db.get_today_stats()
+async def show_main_menu(message: Message, user_id, lang):
+    role = get_role(user_id)
+    t = MESSAGES[lang]
 
-    revenue = stats['cash'] + stats['card'] + stats['qr']
-    total = revenue - stats['refund']
-
-    report = (
-        f"📅 <b>Отчёт за {db.date.today()}</b>\n\n"
-        f"🧾 Чеки: {int(stats['checks'])}\n"
-        f"💰 <b>Выручка: {revenue:,.2f}</b>\n"
-        f"├ Нал: {stats['cash']:,.2f}\n"
-        f"├ Карта: {stats['card']:,.2f}\n"
-        f"└ QR: {stats['qr']:,.2f}\n\n"
-        f"🔙 Возвраты: {stats['refund']:,.2f}\n"
-        f"🏁 <b>ИТОГ ДНЯ: {total:,.2f}</b>"
-    )
-    return report
+    if role == "manager":
+        await message.answer(t["welcome_manager"], reply_markup=kb.get_manager_kb(lang), parse_mode="HTML")
+    elif role == "employee":
+        point = EMPLOYEES[user_id]
+        await message.answer(t["welcome_employee"].format(point=point), reply_markup=kb.get_employee_kb(lang),
+                             parse_mode="HTML")
+    else:
+        await message.answer(t["access_denied"], parse_mode="HTML")
 
 
-# --- ОБРАБОТЧИКИ КОМАНД ---
+# --- ОБРАБОТКА КОМАНД ---
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     user_id = message.from_user.id
+    lang = await db.get_user_lang(user_id)
 
-    if is_employee(user_id):
-        text = (
-            "👋 Привет, Сотрудник!\n\n"
-            "<b>Команды для ввода данных:</b>\n"
-            "/cash [сумма] - Добавить наличные\n"
-            "/card [сумма] - Добавить карту\n"
-            "/qr [сумма] - Добавить QR/перевод\n"
-            "/refund [сумма] - Добавить возврат\n"
-            "/checks [кол-во] - Добавить чеки\n\n"
-            "📤 Отправка отчета:\n"
-            "/report - Сдать смену"
-        )
-        await message.answer(text, parse_mode="HTML")
-
-    elif is_manager(user_id):
-        text = (
-            "👋 Привет, Руководитель!\n\n"
-            "<b>Команды управления:</b>\n"
-            "/get_report - Получить текущий отчёт\n"
-            "/reset - Сбросить данные дня (начать новую смену)"
-        )
-        await message.answer(text, parse_mode="HTML")
-
+    if not lang:
+        await message.answer(MESSAGES["ru"]["choose_lang"], reply_markup=kb.get_lang_kb())
     else:
-        await message.answer("⛔ Доступ запрещен. Обратитесь к администратору.")
+        await show_main_menu(message, user_id, lang)
 
 
-# --- КОМАНДЫ СОТРУДНИКА ---
+@dp.message(Command("lang"))
+async def cmd_lang(message: Message):
+    await message.answer(MESSAGES["ru"]["choose_lang"], reply_markup=kb.get_lang_kb())
 
-# Функция для обработки финансовых команд (уменьшает дублирование кода)
-async def process_finance_command(message: Message, command: CommandObject, col_name: str, data_type=float):
-    if not is_employee(message.from_user.id):
-        await message.answer("⛔ Эта команда доступна только сотрудникам.")
-        return
 
-    if command.args is None:
-        await message.answer(f"⚠ Ошибка ввода. Пример: /{command.command} 100")
-        return
+@dp.callback_query(F.data.startswith("lang_"))
+async def lang_selection(callback: CallbackQuery):
+    lang_code = callback.data.split("_")[1]
+    user_id = callback.from_user.id
+
+    await db.set_user_lang(user_id, lang_code)
+    await callback.message.delete()
+
+    await callback.message.answer(MESSAGES[lang_code]["lang_changed"])
+    await show_main_menu(callback.message, user_id, lang_code)
+
+
+# --- ОБРАБОТКА КНОПКИ ПОМОЩЬ ---
+# Срабатывает и на команду /help, и на нажатие кнопки
+
+@dp.message(lambda msg: any(msg.text == MESSAGES[l]["btn_help"] for l in MESSAGES))
+@dp.message(Command("help"))
+async def cmd_help_handler(message: Message):
+    user_id = message.from_user.id
+    lang = await db.get_user_lang(user_id) or "ru"
+    t = MESSAGES[lang]
+    role = get_role(user_id)
+
+    if role == "manager":
+        text = t["help_text_manager"]
+    elif role == "employee":
+        text = t["help_text_employee"]
+    else:
+        text = t["access_denied"]
+
+    await message.answer(text, parse_mode="HTML")
+
+
+# --- ЛОГИКА ВВОДА ДАННЫХ (Sotrudnik) ---
+
+@dp.message(lambda msg: get_category_code(msg.text) is not None)
+async def start_input(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    if get_role(user_id) != "employee": return
+
+    lang = await db.get_user_lang(user_id) or "ru"
+    cat_code = get_category_code(message.text)
+
+    await state.update_data(category=cat_code, lang=lang)
+    await state.set_state(FinanceForm.waiting_for_amount)
+    await message.answer(MESSAGES[lang]["input_amount"], reply_markup=kb.get_cancel_kb(lang), parse_mode="HTML")
+
+
+@dp.message(lambda msg: any(msg.text == MESSAGES[l]["btn_cancel"] for l in MESSAGES), StateFilter("*"))
+async def cancel_action(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    lang = await db.get_user_lang(user_id) or "ru"
+    await state.clear()
+    await message.answer(MESSAGES[lang]["cancelled"], reply_markup=kb.get_employee_kb(lang))
+
+
+@dp.message(FinanceForm.waiting_for_amount)
+async def process_amount(message: Message, state: FSMContext):
+    data = await state.get_data()
+    lang = data['lang']
+    t = MESSAGES[lang]
 
     try:
-        # Заменяем запятую на точку, если пользователь ошибся
-        value = data_type(command.args.replace(',', '.'))
+        # Убираем пробелы и меняем запятую на точку
+        val = message.text.replace(',', '.').replace(' ', '')
+        amount = float(val)
 
-        if value < 0:
-            await message.answer("⚠ Сумма должна быть положительной.")
-            return
+        await state.update_data(amount=amount)
 
-        await db.add_data(col_name, value)
-
-        # Подтверждение
-        emojis = {
-            "cash": "💵", "card": "💳", "qr": "📱", "refund": "🔙", "checks": "🧾"
-        }
-        await message.answer(f"{emojis.get(col_name, '✅')} Принято: {value}")
+        # Если это расход, просим комментарий
+        if data['category'] == 'expense':
+            await state.set_state(FinanceForm.waiting_for_comment)
+            await message.answer(t["input_comment"], reply_markup=kb.get_cancel_kb(lang), parse_mode="HTML")
+        else:
+            await finish_transaction(message, state, "-")
 
     except ValueError:
-        await message.answer("⚠ Ошибка: введите корректное число.")
+        await message.answer(t["error_digit"], parse_mode="HTML")
 
 
-@dp.message(Command("cash"))
-async def cmd_cash(message: Message, command: CommandObject):
-    await process_finance_command(message, command, "cash")
+@dp.message(FinanceForm.waiting_for_comment)
+async def process_comment(message: Message, state: FSMContext):
+    await finish_transaction(message, state, message.text)
 
 
-@dp.message(Command("card"))
-async def cmd_card(message: Message, command: CommandObject):
-    await process_finance_command(message, command, "card")
+async def finish_transaction(message: Message, state: FSMContext, comment: str):
+    data = await state.get_data()
+    lang = data['lang']
+    user_id = message.from_user.id
+
+    await db.add_transaction(user_id, EMPLOYEES[user_id], data['category'], data['amount'], comment)
+    await state.clear()
+
+    text = MESSAGES[lang]["saved"].format(amount=data['amount'], category=data['category'])
+    await message.answer(text, reply_markup=kb.get_employee_kb(lang), parse_mode="HTML")
 
 
-@dp.message(Command("qr"))
-async def cmd_qr(message: Message, command: CommandObject):
-    await process_finance_command(message, command, "qr")
+# --- ОТЧЕТЫ И УПРАВЛЕНИЕ ---
+
+@dp.message(lambda msg: any(msg.text == MESSAGES[l]["btn_report"] for l in MESSAGES))
+async def employee_report(message: Message):
+    if get_role(message.from_user.id) != "employee": return
+
+    lang = await db.get_user_lang(message.from_user.id) or "ru"
+    location = EMPLOYEES[message.from_user.id]
+
+    stats = await db.get_today_stats(location)
+    revenue = stats['cash'] + stats['card'] + stats['qr']
+    total = revenue - stats['refund'] - stats['expense']
+
+    t = MESSAGES[lang]
+    report = (
+        f"{t['report_title'].format(location=location)}\n"
+        f"🗓 {db.date.today()}\n\n"
+        f"➕ <b>Выручка: {revenue:,.2f}</b>\n"
+        f"  ├ 💵 {stats['cash']:,.2f}\n"
+        f"  ├ 💳 {stats['card']:,.2f}\n"
+        f"  └ 📱 {stats['qr']:,.2f}\n"
+        f"➖➖➖➖➖\n"
+        f"🧾 Чеков: {int(stats['checks'])}\n"
+        f"🔙 Возвраты: {stats['refund']:,.2f}\n"
+        f"📤 Расходы: {stats['expense']:,.2f}\n"
+        f"➖➖➖➖➖\n"
+        f"💰 <b>В КАССЕ: {total:,.2f}</b>"
+    )
+    await message.answer(report, parse_mode="HTML")
 
 
-@dp.message(Command("refund"))
-async def cmd_refund(message: Message, command: CommandObject):
-    await process_finance_command(message, command, "refund")
+@dp.message(lambda msg: any(msg.text == MESSAGES[l]["btn_mgr_report"] for l in MESSAGES))
+async def manager_report(message: Message):
+    if get_role(message.from_user.id) != "manager": return
+
+    lang = await db.get_user_lang(message.from_user.id) or "ru"
+    stats = await db.get_today_stats()  # Общая статистика по всем точкам
+
+    revenue = stats['cash'] + stats['card'] + stats['qr']
+    total = revenue - stats['refund'] - stats['expense']
+
+    text = (
+        f"📊 <b>СВОДКА ПО ВСЕМ ТОЧКАМ</b>\n"
+        f"🗓 {db.date.today()}\n\n"
+        f"➕ Оборот: <b>{revenue:,.2f}</b>\n"
+        f"➖ Расходы: <b>{stats['expense']:,.2f}</b>\n"
+        f"🏁 Чистый итог: <b>{total:,.2f}</b>"
+    )
+    await message.answer(text, parse_mode="HTML")
 
 
-@dp.message(Command("checks"))
-async def cmd_checks(message: Message, command: CommandObject):
-    await process_finance_command(message, command, "checks", data_type=int)
+@dp.message(lambda msg: any(msg.text == MESSAGES[l]["btn_excel"] for l in MESSAGES))
+async def manager_excel(message: Message):
+    if get_role(message.from_user.id) != "manager": return
+    lang = await db.get_user_lang(message.from_user.id) or "ru"
 
-
-@dp.message(Command("report"))
-async def cmd_report_submit(message: Message):
-    if not is_employee(message.from_user.id):
-        await message.answer("⛔ Доступ запрещен.")
-        return
-
-    report_text = await generate_report_text()
-
-    # Отправка отчета всем руководителям
-    count = 0
-    for admin_id in MANAGERS_IDS:
-        try:
-            await bot.send_message(admin_id, f"📩 <b>Отчет от сотрудника:</b>\n\n{report_text}", parse_mode="HTML")
-            count += 1
-        except Exception as e:
-            logging.error(f"Не удалось отправить отчет руководителю {admin_id}: {e}")
-
-    if count > 0:
-        await message.answer("✅ Отчёт успешно отправлен руководителю.")
+    await message.answer(MESSAGES[lang]["report_generated"])
+    path = await db.export_to_excel()
+    if path:
+        await message.answer_document(FSInputFile(path))
+        os.remove(path)
     else:
-        await message.answer("⚠ Ошибка отправки. Руководитель не найден или заблокировал бота.")
+        await message.answer(MESSAGES[lang]["no_data"])
 
 
-# --- КОМАНДЫ РУКОВОДИТЕЛЯ ---
+@dp.message(lambda msg: any(msg.text == MESSAGES[l]["btn_reset"] for l in MESSAGES))
+async def manager_reset(message: Message):
+    if get_role(message.from_user.id) != "manager": return
+    lang = await db.get_user_lang(message.from_user.id) or "ru"
 
-@dp.message(Command("get_report"))
-async def cmd_get_report(message: Message):
-    if not is_manager(message.from_user.id):
-        await message.answer("⛔ Доступ запрещен.")
-        return
-
-    report_text = await generate_report_text()
-    await message.answer(report_text, parse_mode="HTML")
-
-
-@dp.message(Command("reset"))
-async def cmd_reset(message: Message):
-    if not is_manager(message.from_user.id):
-        await message.answer("⛔ Доступ запрещен.")
-        return
-
-    await db.reset_today_stats()
-    await message.answer("🔄 <b>Смена сброшена.</b> Данные за сегодня обнулены.", parse_mode="HTML")
+    await db.reset_today()
+    await message.answer(MESSAGES[lang]["reset_done"], parse_mode="HTML")
 
 
 # --- ЗАПУСК ---
-
 async def main():
-    # Инициализация БД при старте
     await db.init_db()
-    print("Бот запущен...")
-    # Удаляем вебхуки и запускаем поллинг
+    print("Bot started successfully.")
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
@@ -195,7 +257,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("Бот остановлен")
-
-
-
+        print("Bot stopped")
