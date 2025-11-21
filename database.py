@@ -72,6 +72,37 @@ async def get_today_stats(location: str = None):
     return stats
 
 
+# --- НОВАЯ ФУНКЦИЯ ДЛЯ ИИ ---
+async def get_weekly_summary():
+    """Готовит текстовую сводку за последние 7 дней."""
+    query = """
+        SELECT date(created_at), category, SUM(amount), GROUP_CONCAT(comment, ', ')
+        FROM transactions 
+        WHERE created_at >= date('now', '-7 days')
+        GROUP BY date(created_at), category
+        ORDER BY created_at ASC
+    """
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute(query)
+        rows = await cursor.fetchall()
+
+    if not rows:
+        return "Нет данных за неделю."
+
+    # Формируем текст: "2023-10-01: Нал 5000, Расход 200 (Такси)..."
+    text_report = ""
+    current_date = ""
+    for r_date, cat, amount, comments in rows:
+        if r_date != current_date:
+            text_report += f"\n📅 {r_date}:\n"
+            current_date = r_date
+
+        comment_part = f"({comments})" if comments and cat == 'expense' else ""
+        text_report += f"  - {cat}: {amount} {comment_part}\n"
+
+    return text_report
+
+
 async def export_to_excel():
     async with aiosqlite.connect(DB_NAME) as db:
         query = "SELECT id, location, category, amount, comment, created_at FROM transactions ORDER BY created_at DESC"

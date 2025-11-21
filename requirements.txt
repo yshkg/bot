@@ -3,3 +3,4 @@ aiosqlite
 pandas
 openpyxl
 python-dotenv
+google-generativeai
