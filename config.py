@@ -1,9 +1,9 @@
 import os
 
 # Вставьте сюда токен, полученный от BotFather
-BOT_TOKEN = "8591662419:AAHEMsI2dqEJj2wU1lSlJR7IfYDR8uR4MOU"
+BOT_TOKEN = ""
 
-GOOGLE_API_KEY = "AIzaSyBijMzip_m2MLHsOx4so-F92F8ovi3cr-A"
+GOOGLE_API_KEY = ""
 
 
 # Настройка прав доступа
@@ -11,9 +11,9 @@ GOOGLE_API_KEY = "AIzaSyBijMzip_m2MLHsOx4so-F92F8ovi3cr-A"
 EMPLOYEES = {
     1234956455: "Касса №1",
 
-    1066078339: "Касса №2"
+    911204617: "Касса №2"
 }
 
-MANAGERS = [6129753760]  # ID Руководителей
+MANAGERS = [6129753760, 1841923720]  # ID Руководителей
 
 DB_NAME = "finance_pro.db"
